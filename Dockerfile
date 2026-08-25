@@ -32,3 +32,4 @@ RUN bash download_weights.sh || \
 
 COPY handler.py /app/MuseTalk/handler.py
 CMD ["python", "-u", "/app/MuseTalk/handler.py"]
+ 
