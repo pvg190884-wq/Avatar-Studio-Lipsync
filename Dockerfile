@@ -30,7 +30,12 @@ RUN pip install --no-cache-dir runpod
 RUN bash download_weights.sh || \
     (echo "download_weights.sh не найден или упал — проверить актуальный способ загрузки весов в README репозитория" && exit 1)
 
+# Фикс конфликта версий: openmim/mmcv/mmdet/mmpose (или runpod) подтягивают
+# более новый huggingface_hub, чем допускает transformers (WhisperModel из
+# MuseTalk/scripts/inference.py требует huggingface_hub<1.0,>=0.19.3).
+# Ставим ПОСЛЕДНИМ шагом, чтобы никто из предыдущих pip install не
+# перезаписал версию снова.
+RUN pip install --no-cache-dir "huggingface_hub>=0.19.3,<1.0"
+
 COPY handler.py /app/MuseTalk/handler.py
 CMD ["python", "-u", "/app/MuseTalk/handler.py"]
- 
-  
