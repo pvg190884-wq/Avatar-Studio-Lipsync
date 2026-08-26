@@ -30,6 +30,13 @@ RUN pip install --no-cache-dir runpod
 RUN bash download_weights.sh || \
     (echo "download_weights.sh не найден или упал — проверить актуальный способ загрузки весов в README репозитория" && exit 1)
 
+# download_weights.sh тихо не докачивает вес DWPose (внутри он использует
+# устаревший аргумент `gdown --id`, который упал с ошибкой, но не остановил
+# сборку) — качаем его вручную напрямую с HuggingFace.
+RUN mkdir -p models/dwpose && \
+    curl -L -o models/dwpose/dw-ll_ucoco_384.pth \
+    https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.pth
+
 # Фикс конфликта версий: openmim/mmcv/mmdet/mmpose (или runpod) подтягивают
 # более новый huggingface_hub, чем допускает transformers (WhisperModel из
 # MuseTalk/scripts/inference.py требует huggingface_hub<1.0,>=0.19.3).
