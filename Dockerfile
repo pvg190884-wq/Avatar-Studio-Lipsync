@@ -55,6 +55,17 @@ RUN mkdir -p models/musetalk && \
     curl -L -o models/musetalk/pytorch_model.bin \
     https://huggingface.co/TMElyralab/MuseTalk/resolve/main/musetalk/pytorch_model.bin
 
+# И whisper — эта версия MuseTalk использует transformers.AutoFeatureExtractor,
+# который ожидает полный HuggingFace-формат (config.json + pytorch_model.bin +
+# preprocessor_config.json), а не старый одиночный файл tiny.pt.
+RUN mkdir -p models/whisper && \
+    curl -L -o models/whisper/config.json \
+    https://huggingface.co/openai/whisper-tiny/resolve/main/config.json && \
+    curl -L -o models/whisper/pytorch_model.bin \
+    https://huggingface.co/openai/whisper-tiny/resolve/main/pytorch_model.bin && \
+    curl -L -o models/whisper/preprocessor_config.json \
+    https://huggingface.co/openai/whisper-tiny/resolve/main/preprocessor_config.json
+
 # Фикс конфликта версий: openmim/mmcv/mmdet/mmpose (или runpod) подтягивают
 # более новый huggingface_hub, чем допускает transformers (WhisperModel из
 # MuseTalk/scripts/inference.py требует huggingface_hub<1.0,>=0.19.3).
