@@ -66,6 +66,13 @@ RUN mkdir -p models/whisper && \
     curl -L -o models/whisper/preprocessor_config.json \
     https://huggingface.co/openai/whisper-tiny/resolve/main/preprocessor_config.json
 
+# И последняя по списку — face-parse-bisent (79999_iter.pth + resnet18).
+RUN mkdir -p models/face-parse-bisent && \
+    curl -L -o models/face-parse-bisent/79999_iter.pth \
+    https://huggingface.co/camenduru/MuseTalk/resolve/main/face-parse-bisent/79999_iter.pth && \
+    curl -L -o models/face-parse-bisent/resnet18-5c106cde.pth \
+    https://download.pytorch.org/models/resnet18-5c106cde.pth
+
 # Фикс конфликта версий: openmim/mmcv/mmdet/mmpose (или runpod) подтягивают
 # более новый huggingface_hub, чем допускает transformers (WhisperModel из
 # MuseTalk/scripts/inference.py требует huggingface_hub<1.0,>=0.19.3).
