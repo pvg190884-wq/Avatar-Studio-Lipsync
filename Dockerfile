@@ -19,8 +19,10 @@ RUN pip install --no-cache-dir openmim && \
     mim install "mmdet>=3.1.0" && \
     mim install "mmpose>=1.1.0"
 
-# runpod SDK для serverless-хендлера
-RUN pip install --no-cache-dir runpod
+# runpod SDK для serverless-хендлера + pyyaml для генерации
+# inference_config.yaml на лету (MuseTalk принимает пути к видео/аудио
+# только через YAML-конфиг, не через прямые CLI-аргументы)
+RUN pip install --no-cache-dir runpod pyyaml
 
 # Загрузка весов моделей (musetalk, sd-vae-ft-mse, whisper, dwpose,
 # face-parse-bisent) — MuseTalk поставляет скрипт для этого в репозитории.
