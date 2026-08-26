@@ -47,6 +47,14 @@ RUN mkdir -p models/sd-vae && \
     curl -L -o models/sd-vae/diffusion_pytorch_model.bin \
     https://huggingface.co/stabilityai/sd-vae-ft-mse/resolve/main/diffusion_pytorch_model.bin
 
+# И основную модель MuseTalk (musetalk.json + pytorch_model.bin) —
+# download_weights.sh не докачивает и её. Качаем вручную с HuggingFace.
+RUN mkdir -p models/musetalk && \
+    curl -L -o models/musetalk/musetalk.json \
+    https://huggingface.co/TMElyralab/MuseTalk/resolve/main/musetalk/musetalk.json && \
+    curl -L -o models/musetalk/pytorch_model.bin \
+    https://huggingface.co/TMElyralab/MuseTalk/resolve/main/musetalk/pytorch_model.bin
+
 # Фикс конфликта версий: openmim/mmcv/mmdet/mmpose (или runpod) подтягивают
 # более новый huggingface_hub, чем допускает transformers (WhisperModel из
 # MuseTalk/scripts/inference.py требует huggingface_hub<1.0,>=0.19.3).
