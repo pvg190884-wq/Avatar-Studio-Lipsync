@@ -38,6 +38,12 @@ def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
         "python", "-m", "scripts.inference",
         "--inference_config", config_path,
         "--result_dir", result_dir,
+        # Дефолтный путь в scripts.inference ожидает models/musetalk/config.json,
+        # но реально скачанный файл называется musetalk.json (см. официальную
+        # структуру весов в README репозитория) — указываем явно, чтобы не
+        # промахнуться по имени.
+        "--unet_config", "./models/musetalk/musetalk.json",
+        "--unet_model_path", "./models/musetalk/pytorch_model.bin",
     ]
 
     proc = subprocess.run(
