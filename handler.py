@@ -4,6 +4,7 @@ import subprocess
 import os
 import uuid
 import shutil
+import yaml
 
 # Аналогично SadTalker-воркеру: НЕ загружаем тяжёлые модели при старте
 # контейнера, чтобы холодный старт воркера успевал пройти проверку
@@ -13,22 +14,29 @@ import shutil
 # по устройству самого MuseTalk CLI.
 
 
-def run_musetalk_inference(video_path, audio_path, result_dir):
+def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
     """Запускает inference MuseTalk через его CLI-скрипт.
 
-    ВАЖНО: точное имя скрипта, названия аргументов и формат конфигурации
-    могут отличаться от версии к версии репозитория MuseTalk — это
-    первая черновая версия, скорее всего потребует правки после первого
-    реального запуска (по аналогии с тем, как дорабатывался SadTalker).
-    Нужно свериться с README/inference-примерами в самом репозитории и
-    поправить cmd ниже под то, что там реально ожидается.
-    """
+    ВАЖНО: у scripts.inference MuseTalk нет прямых аргументов
+    --video_path/--audio_path — вместо этого он принимает YAML-файл
+    через --inference_config, где перечисляются задачи (video_path +
+    audio_path на каждую). Формируем такой конфиг на лету под один
+    запрос."""
     os.makedirs(result_dir, exist_ok=True)
+
+    inference_config = {
+        "task_0": {
+            "video_path": video_path,
+            "audio_path": audio_path,
+        }
+    }
+    config_path = f"{work_dir}/inference_config.yaml"
+    with open(config_path, "w") as f:
+        yaml.safe_dump(inference_config, f)
 
     cmd = [
         "python", "-m", "scripts.inference",
-        "--video_path", video_path,
-        "--audio_path", audio_path,
+        "--inference_config", config_path,
         "--result_dir", result_dir,
     ]
 
@@ -73,7 +81,7 @@ def handler(event):
             f.write(base64.b64decode(input_data["audio_base64"]))
 
         result_dir = f"{work_dir}/results"
-        output_video_path = run_musetalk_inference(video_path, audio_path, result_dir)
+        output_video_path = run_musetalk_inference(video_path, audio_path, work_dir, result_dir)
 
         with open(output_video_path, "rb") as vf:
             video_base64 = base64.b64encode(vf.read()).decode("utf-8")
@@ -89,5 +97,3 @@ def handler(event):
 
 
 runpod.serverless.start({"handler": handler})
-  
- 
