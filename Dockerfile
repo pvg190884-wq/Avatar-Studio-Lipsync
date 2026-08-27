@@ -47,13 +47,14 @@ RUN mkdir -p models/sd-vae && \
     curl -L -o models/sd-vae/diffusion_pytorch_model.bin \
     https://huggingface.co/stabilityai/sd-vae-ft-mse/resolve/main/diffusion_pytorch_model.bin
 
-# И основную модель MuseTalk (musetalk.json + pytorch_model.bin) —
-# download_weights.sh не докачивает и её. Качаем вручную с HuggingFace.
-RUN mkdir -p models/musetalk && \
-    curl -L -o models/musetalk/musetalk.json \
-    https://huggingface.co/TMElyralab/MuseTalk/resolve/main/musetalk/musetalk.json && \
-    curl -L -o models/musetalk/pytorch_model.bin \
-    https://huggingface.co/TMElyralab/MuseTalk/resolve/main/musetalk/pytorch_model.bin
+# MuseTalk 1.5 (рекомендованная разработчиками версия — заметно чище
+# по качеству, особенно в области рта, чем версия 1.0). Весит больше
+# (~3.4 ГБ unet.pth), но именно это и нужно для нормального результата.
+RUN mkdir -p models/musetalkV15 && \
+    curl -L -o models/musetalkV15/musetalk.json \
+    https://huggingface.co/TMElyralab/MuseTalk/resolve/main/musetalkV15/musetalk.json && \
+    curl -L -o models/musetalkV15/unet.pth \
+    https://huggingface.co/TMElyralab/MuseTalk/resolve/main/musetalkV15/unet.pth
 
 # И whisper — эта версия MuseTalk использует transformers.AutoFeatureExtractor,
 # который ожидает полный HuggingFace-формат (config.json + pytorch_model.bin +
