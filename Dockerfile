@@ -83,3 +83,4 @@ RUN pip install --no-cache-dir "huggingface_hub>=0.19.3,<1.0"
 
 COPY handler.py /app/MuseTalk/handler.py
 CMD ["python", "-u", "/app/MuseTalk/handler.py"]
+ 
