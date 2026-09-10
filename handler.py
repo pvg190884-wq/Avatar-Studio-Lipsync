@@ -16,7 +16,6 @@ import yaml
 
 def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
     """Запускает inference MuseTalk через его CLI-скрипт.
-
     ВАЖНО: у scripts.inference MuseTalk нет прямых аргументов
     --video_path/--audio_path — вместо этого он принимает YAML-файл
     через --inference_config, где перечисляются задачи (video_path +
@@ -61,6 +60,97 @@ def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
     raise RuntimeError("MuseTalk не создал видео")
 
 
+# ---------------------------------------------------------------------------
+# GFPGAN — постобработка для устранения размытия в области рта.
+#
+# MuseTalk генерирует область рта во внутреннем разрешении 256x256 и
+# вклеивает её обратно в исходный кадр — при более высоком разрешении
+# видео это выглядит как заметное размытие именно там, где двигаются
+# губы. Это задокументированное ограничение самой модели (не баг в
+# нашем коде), и официально рекомендованное решение — прогнать готовое
+# видео через модель восстановления лица (face restoration) как
+# финальный шаг.
+#
+# Модель грузится один раз лениво (тот же паттерн, что XTTS/SadTalker
+# в другом воркере) и переиспользуется между запросами на одном
+# воркере.
+# ---------------------------------------------------------------------------
+
+_gfpgan_restorer = None
+
+
+def get_gfpgan_restorer():
+    global _gfpgan_restorer
+    if _gfpgan_restorer is None:
+        print("Загружаю GFPGAN...")
+        from gfpgan import GFPGANer
+        _gfpgan_restorer = GFPGANer(
+            model_path="/app/MuseTalk/gfpgan_weights/GFPGANv1.4.pth",
+            upscale=1,  # не увеличиваем разрешение кадра, только резкость лица
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=None,  # фон не трогаем — не нужен, экономит время
+        )
+        print("GFPGAN готова.")
+    return _gfpgan_restorer
+
+
+def enhance_video_with_gfpgan(input_video_path, work_dir):
+    """Разбирает готовое видео на кадры, прогоняет каждый через GFPGAN
+    для повышения резкости лица (в первую очередь — области рта),
+    затем собирает обратно в видео с исходной аудиодорожкой и fps.
+    Возвращает путь к улучшенному файлу."""
+    import cv2
+
+    restorer = get_gfpgan_restorer()
+
+    frames_dir = os.path.join(work_dir, "gfpgan_frames_in")
+    enhanced_dir = os.path.join(work_dir, "gfpgan_frames_out")
+    os.makedirs(frames_dir, exist_ok=True)
+    os.makedirs(enhanced_dir, exist_ok=True)
+
+    # Узнаём реальный fps исходного видео, чтобы не потерять синхронизацию
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=r_frame_rate", "-of",
+         "default=noprint_wrappers=1:nokey=1", input_video_path],
+        capture_output=True, text=True
+    )
+    fps = probe.stdout.strip() or "25/1"
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", input_video_path, f"{frames_dir}/frame_%06d.png"],
+        capture_output=True, text=True, check=True
+    )
+
+    frame_files = sorted(os.listdir(frames_dir))
+    if not frame_files:
+        raise RuntimeError("ffmpeg не извлёк ни одного кадра для GFPGAN")
+
+    for fname in frame_files:
+        img = cv2.imread(os.path.join(frames_dir, fname))
+        _, _, restored_img = restorer.enhance(
+            img, has_aligned=False, only_center_face=False, paste_back=True
+        )
+        cv2.imwrite(os.path.join(enhanced_dir, fname), restored_img)
+
+    enhanced_video_path = os.path.join(work_dir, "enhanced.mp4")
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-r", fps, "-i", f"{enhanced_dir}/frame_%06d.png",
+            "-i", input_video_path,
+            "-map", "0:v:0", "-map", "1:a:0?",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest",
+            enhanced_video_path,
+        ],
+        capture_output=True, text=True, check=True
+    )
+
+    return enhanced_video_path
+
+
 def handler(event):
     input_data = event.get("input", {}) or {}
 
@@ -89,6 +179,15 @@ def handler(event):
 
         result_dir = f"{work_dir}/results"
         output_video_path = run_musetalk_inference(video_path, audio_path, work_dir, result_dir)
+
+        # Постобработка GFPGAN — не должна ронять всю задачу, если вдруг
+        # упадёт по какой-то причине: в этом случае просто отдаём видео
+        # без улучшения резкости, а не оставляем клиента совсем без
+        # результата.
+        try:
+            output_video_path = enhance_video_with_gfpgan(output_video_path, work_dir)
+        except Exception as e:
+            print(f"GFPGAN-постобработка не удалась, отдаём видео без неё: {e}")
 
         with open(output_video_path, "rb") as vf:
             video_base64 = base64.b64encode(vf.read()).decode("utf-8")
