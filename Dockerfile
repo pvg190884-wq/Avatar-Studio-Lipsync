@@ -81,6 +81,26 @@ RUN mkdir -p models/face-parse-bisent && \
 # перезаписал версию снова.
 RUN pip install --no-cache-dir "huggingface_hub>=0.19.3,<1.0"
 
+# ---------------------------------------------------------------------
+# GFPGAN — финальный шаг постобработки для устранения размытия рта.
+# MuseTalk генерирует область рта во внутреннем разрешении 256x256 и
+# вклеивает обратно в кадр — при более высоком разрешении исходного
+# видео это выглядит как размытие именно в области рта (задокументи-
+# ровано в самом MuseTalk README как известное ограничение модели).
+# GFPGAN восстанавливает резкость лица кадр за кадром поверх готового
+# результата MuseTalk.
+#
+# ВНИМАНИЕ: basicsr (зависимость GFPGAN) исторически конфликтует с
+# новыми версиями torchvision (импортирует убранный оттуда модуль
+# torchvision.transforms.functional_tensor). На связке PyTorch 2.1.0 /
+# torchvision ~0.16.x (эта версия базового образа) этот модуль ещё
+# существует, так что конфликта быть не должно — но если сборка
+# упадёт именно на этом шаге с ошибкой импорта, ищи
+# "functional_tensor" в трейсбеке.
+RUN pip install --no-cache-dir gfpgan facexlib basicsr opencv-python-headless
+RUN mkdir -p /app/MuseTalk/gfpgan_weights && \
+    curl -L -o /app/MuseTalk/gfpgan_weights/GFPGANv1.4.pth \
+    https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
+
 COPY handler.py /app/MuseTalk/handler.py
 CMD ["python", "-u", "/app/MuseTalk/handler.py"]
- 
