@@ -76,22 +76,25 @@ RUN mkdir -p models/face-parse-bisent && \
 
 # ---------------------------------------------------------------------
 # GFPGAN — финальный шаг постобработки для устранения размытия рта.
-# ВАЖНО: этот блок должен идти ДО пина huggingface_hub чуть ниже —
-# gfpgan/facexlib/basicsr при разрешении своих зависимостей могут
-# подтянуть другую версию huggingface_hub/tokenizers, что ломает импорт
-# transformers/diffusers, нужный самому MuseTalk (Whisper, VAE). Пин
-# ниже должен оставаться АБСОЛЮТНО последним pip-шагом в файле.
 RUN pip install --no-cache-dir gfpgan facexlib basicsr opencv-python-headless
 RUN mkdir -p /app/MuseTalk/gfpgan_weights && \
     curl -L -o /app/MuseTalk/gfpgan_weights/GFPGANv1.4.pth \
     https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
 
-# Фикс конфликта версий: openmim/mmcv/mmdet/mmpose (или runpod, или
-# gfpgan/basicsr выше) подтягивают более новый huggingface_hub, чем
-# допускает transformers (WhisperModel из MuseTalk/scripts/inference.py
-# требует huggingface_hub<1.0,>=0.19.3). Ставим ПОСЛЕДНИМ pip-шагом,
-# чтобы никто из предыдущих pip install не перезаписал версию снова.
+# Фикс конфликта версий huggingface_hub (см. историю правок).
 RUN pip install --no-cache-dir "huggingface_hub>=0.19.3,<1.0"
+
+# ФИКС: gfpgan/basicsr/facexlib при установке подтягивают numpy 2.x —
+# а скомпилированные C-расширения, которые используют transformers и
+# diffusers в этом образе (собранном под старую связку CUDA 11.8 /
+# PyTorch 2.1.0), рассчитаны на ABI numpy 1.x. Несовпадение именно
+# такого рода даёт ошибку "Unable to convert function return value to
+# a Python type! The signature was () -> handle" при импорте — это её
+# самая частая задокументированная причина в принципе (не только в
+# нашем случае, тот же симптом встречается в TensorFlow/OpenVINO при
+# том же несовпадении numpy). Абсолютно последний pip-шаг в файле —
+# ничего после него больше не устанавливаем.
+RUN pip install --no-cache-dir "numpy<2"
 
 COPY handler.py /app/MuseTalk/handler.py
 CMD ["python", "-u", "/app/MuseTalk/handler.py"]
