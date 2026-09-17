@@ -74,33 +74,24 @@ RUN mkdir -p models/face-parse-bisent && \
     curl -L -o models/face-parse-bisent/resnet18-5c106cde.pth \
     https://download.pytorch.org/models/resnet18-5c106cde.pth
 
-# Фикс конфликта версий: openmim/mmcv/mmdet/mmpose (или runpod) подтягивают
-# более новый huggingface_hub, чем допускает transformers (WhisperModel из
-# MuseTalk/scripts/inference.py требует huggingface_hub<1.0,>=0.19.3).
-# Ставим ПОСЛЕДНИМ шагом, чтобы никто из предыдущих pip install не
-# перезаписал версию снова.
-RUN pip install --no-cache-dir "huggingface_hub>=0.19.3,<1.0"
-
 # ---------------------------------------------------------------------
 # GFPGAN — финальный шаг постобработки для устранения размытия рта.
-# MuseTalk генерирует область рта во внутреннем разрешении 256x256 и
-# вклеивает обратно в кадр — при более высоком разрешении исходного
-# видео это выглядит как размытие именно в области рта (задокументи-
-# ровано в самом MuseTalk README как известное ограничение модели).
-# GFPGAN восстанавливает резкость лица кадр за кадром поверх готового
-# результата MuseTalk.
-#
-# ВНИМАНИЕ: basicsr (зависимость GFPGAN) исторически конфликтует с
-# новыми версиями torchvision (импортирует убранный оттуда модуль
-# torchvision.transforms.functional_tensor). На связке PyTorch 2.1.0 /
-# torchvision ~0.16.x (эта версия базового образа) этот модуль ещё
-# существует, так что конфликта быть не должно — но если сборка
-# упадёт именно на этом шаге с ошибкой импорта, ищи
-# "functional_tensor" в трейсбеке.
+# ВАЖНО: этот блок должен идти ДО пина huggingface_hub чуть ниже —
+# gfpgan/facexlib/basicsr при разрешении своих зависимостей могут
+# подтянуть другую версию huggingface_hub/tokenizers, что ломает импорт
+# transformers/diffusers, нужный самому MuseTalk (Whisper, VAE). Пин
+# ниже должен оставаться АБСОЛЮТНО последним pip-шагом в файле.
 RUN pip install --no-cache-dir gfpgan facexlib basicsr opencv-python-headless
 RUN mkdir -p /app/MuseTalk/gfpgan_weights && \
     curl -L -o /app/MuseTalk/gfpgan_weights/GFPGANv1.4.pth \
     https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
+
+# Фикс конфликта версий: openmim/mmcv/mmdet/mmpose (или runpod, или
+# gfpgan/basicsr выше) подтягивают более новый huggingface_hub, чем
+# допускает transformers (WhisperModel из MuseTalk/scripts/inference.py
+# требует huggingface_hub<1.0,>=0.19.3). Ставим ПОСЛЕДНИМ pip-шагом,
+# чтобы никто из предыдущих pip install не перезаписал версию снова.
+RUN pip install --no-cache-dir "huggingface_hub>=0.19.3,<1.0"
 
 COPY handler.py /app/MuseTalk/handler.py
 CMD ["python", "-u", "/app/MuseTalk/handler.py"]
