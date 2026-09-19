@@ -14,6 +14,58 @@ import yaml
 # по устройству самого MuseTalk CLI.
 
 
+def get_media_duration_seconds(path):
+    """Читает длительность файла через ffprobe (в секундах, float)."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        raise RuntimeError(f"Не удалось определить длительность файла {path}: {result.stderr}")
+
+
+def trim_video_to_audio_length(video_path, audio_path, work_dir):
+    """Корень бага 'MuseTalk не создал видео' (exit code 0, без файла):
+    MuseTalk индексирует аудио-признаки (whisper features) по номеру
+    кадра видео — если видео длиннее аудио-драйвера, для кадров в конце
+    видео индекс уходит за пределы массива признаков (см. диагностику в
+    чате: frame_index: 478 при audio_index до 408, при whisper_feature
+    длиной всего 407), и inference падает без записи mp4.
+
+    Подрезаем видео по длительности аудио заранее, с небольшим запасом,
+    чтобы не упереться в ту же границу из-за неточностей округления
+    кадров/окон whisper. Если видео короче или равно аудио — трогать
+    нечего, отдаём исходный файл как есть."""
+    video_duration = get_media_duration_seconds(video_path)
+    audio_duration = get_media_duration_seconds(audio_path)
+
+    SAFETY_MARGIN_SECONDS = 0.15
+    target_duration = audio_duration - SAFETY_MARGIN_SECONDS
+
+    if video_duration <= audio_duration or target_duration <= 0:
+        return video_path
+
+    trimmed_path = os.path.join(work_dir, "source_video_trimmed.mp4")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", video_path,
+                "-t", f"{target_duration:.3f}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-an",
+                trimmed_path,
+            ],
+            capture_output=True, text=True, check=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Не удалось подрезать видео по длительности аудио: {e.stderr[-1500:]}")
+
+    return trimmed_path
+
+
 def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
     """Запускает inference MuseTalk через его CLI-скрипт.
     ВАЖНО: у scripts.inference MuseTalk нет прямых аргументов
@@ -58,11 +110,9 @@ def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
             if f.endswith(".mp4"):
                 return os.path.join(root, f)
 
-    # "Тихий" сбой: код завершения 0, но выходного файла нет. Раньше
-    # здесь была голая фраза без диагностики — теперь включаем хвосты
-    # обоих потоков вывода MuseTalk, чтобы при следующем повторении
-    # бага сразу увидеть реальную причину (чаще всего — не найдено лицо
-    # ни на одном кадре видео), а не гадать заново.
+    # "Тихий" сбой: код завершения 0, но выходного файла нет. Оставлено
+    # на случай, если trim_video_to_audio_length не покрыла все причины —
+    # stdout/stderr дадут диагностику для следующего разбора.
     raise RuntimeError(
         "MuseTalk не создал видео.\n"
         f"--- stdout (конец) ---\n{proc.stdout[-2000:]}\n"
@@ -186,6 +236,8 @@ def handler(event):
         audio_path = f"{work_dir}/driven_audio.wav"
         with open(audio_path, "wb") as f:
             f.write(base64.b64decode(input_data["audio_base64"]))
+
+        video_path = trim_video_to_audio_length(video_path, audio_path, work_dir)
 
         result_dir = f"{work_dir}/results"
         output_video_path = run_musetalk_inference(video_path, audio_path, work_dir, result_dir)
