@@ -13,78 +13,6 @@ import yaml
 # здесь просто нет глобальной загрузки на этапе импорта — уже "лениво"
 # по устройству самого MuseTalk CLI.
 
-# Ошибка "MuseTalk не создал видео" (exit code 0, файла нет) — это
-# исчерпывающе диагностированный off-by-N баг в сопоставлении
-# кадр видео -> индекс аудио-признака у последних кадров ролика (см.
-# историю чата). Подрезка фиксированного числа кадров ЧАСТИЧНО решает
-# проблему, но не полностью — судя по наблюдениям, массив признаков
-# сам пересчитывается от длины уже обрезанного видео, так что нужный
-# запас "плавает" в зависимости от исходной длительности/fps и заранее
-# точно не вычисляется без доступа к внутренностям этой сборки
-# MuseTalk. Поэтому вместо одной статичной подрезки — несколько попыток
-# со всё большей подрезкой, если конкретно эта ошибка повторяется.
-TRIM_ATTEMPTS_FRAMES = [8, 20, 40, 70]
-
-
-def probe_video_frames_and_fps(video_path):
-    """Возвращает (nb_frames, fps), посчитанные из РЕАЛЬНОГО числа
-    декодированных кадров — то же самое, что видит MuseTalk при
-    покадровом чтении файла (метаданным контейнера доверять нельзя,
-    см. историю чата)."""
-    probe = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
-            "-show_entries", "stream=nb_read_frames,avg_frame_rate",
-            "-of", "default=noprint_wrappers=1",
-            video_path,
-        ],
-        capture_output=True, text=True
-    )
-    values = {}
-    for line in probe.stdout.strip().splitlines():
-        if "=" in line:
-            key, _, value = line.partition("=")
-            values[key.strip()] = value.strip()
-
-    nb_frames = int(values["nb_read_frames"])
-    num, den = values["avg_frame_rate"].split("/")
-    fps = float(num) / float(den)
-    return nb_frames, fps
-
-
-def trim_trailing_video_frames(original_video_path, work_dir, frames_to_drop):
-    """Отрезает frames_to_drop последних кадров исходного видео (доли
-    секунды при typичных fps). Всегда работает от original_video_path,
-    а не от уже обрезанной версии — чтобы повторные попытки не
-    накапливали подрезку сверх задуманной."""
-    nb_frames, fps = probe_video_frames_and_fps(original_video_path)
-
-    if nb_frames <= frames_to_drop:
-        return original_video_path
-
-    keep_frames = nb_frames - frames_to_drop
-    trimmed_duration = keep_frames / fps
-    trimmed_path = os.path.join(work_dir, f"source_video_trim{frames_to_drop}.mp4")
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", original_video_path,
-            "-t", f"{trimmed_duration:.4f}",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-an",
-            trimmed_path,
-        ],
-        capture_output=True, text=True, check=True
-    )
-    return trimmed_path
-
-
-def is_no_output_video_error(exc):
-    """True, если исключение — тот самый диагностированный сбой
-    (exit code 0, но mp4 не создан), а не что-то другое (например,
-    реальный краш MuseTalk по другой причине). Только в этом случае
-    имеет смысл повторять попытку с большей подрезкой видео."""
-    return isinstance(exc, RuntimeError) and str(exc).startswith("MuseTalk не создал видео")
-
 
 def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
     """Запускает inference MuseTalk через его CLI-скрипт.
@@ -92,7 +20,15 @@ def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
     --video_path/--audio_path — вместо этого он принимает YAML-файл
     через --inference_config, где перечисляются задачи (video_path +
     audio_path на каждую). Формируем такой конфиг на лету под один
-    запрос."""
+    запрос.
+
+    Ранее здесь были обходные пути для бага "MuseTalk не создал видео"
+    (подрезка видео, паддинг аудио, повторные попытки) — все они лечили
+    симптом, а не причину. Настоящая причина — off-by-N edge-case
+    внутри самой библиотеки MuseTalk (musetalk/utils/audio_processor.py),
+    из-за которого процесс завершался с кодом 0 без записи файла (exit()
+    без аргументов = sys.exit(None)). Пофикшено патчем исходника прямо
+    в Docker-образе — см. patch_musetalk_audio.py и Dockerfile."""
     os.makedirs(result_dir, exist_ok=True)
 
     inference_config = {
@@ -130,31 +66,14 @@ def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
             if f.endswith(".mp4"):
                 return os.path.join(root, f)
 
+    # Если эта ветка всё же сработает после патча — значит, патч не
+    # покрыл какой-то другой сценарий, и stdout/stderr дадут диагностику
+    # для следующего разбора.
     raise RuntimeError(
         "MuseTalk не создал видео.\n"
         f"--- stdout (конец) ---\n{proc.stdout[-2000:]}\n"
         f"--- stderr (конец) ---\n{proc.stderr[-2000:]}"
     )
-
-
-def run_musetalk_with_retries(original_video_path, audio_path, work_dir):
-    """Обёртка над run_musetalk_inference с автоматическими повторами
-    при увеличивающейся подрезке хвоста видео — см. комментарий у
-    TRIM_ATTEMPTS_FRAMES выше про причину, почему одна фиксированная
-    подрезка не гарантирует успех для любого видео."""
-    last_exc = None
-    for attempt_index, frames_to_drop in enumerate(TRIM_ATTEMPTS_FRAMES, start=1):
-        result_dir = os.path.join(work_dir, f"results_attempt{attempt_index}")
-        video_path = trim_trailing_video_frames(original_video_path, work_dir, frames_to_drop)
-        try:
-            return run_musetalk_inference(video_path, audio_path, work_dir, result_dir)
-        except Exception as e:
-            last_exc = e
-            if not is_no_output_video_error(e):
-                raise
-            print(f"Попытка {attempt_index} (подрезка {frames_to_drop} кадров) не удалась: {e}. Пробую следующую.")
-
-    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +193,8 @@ def handler(event):
         with open(audio_path, "wb") as f:
             f.write(base64.b64decode(input_data["audio_base64"]))
 
-        output_video_path = run_musetalk_with_retries(video_path, audio_path, work_dir)
+        result_dir = f"{work_dir}/results"
+        output_video_path = run_musetalk_inference(video_path, audio_path, work_dir, result_dir)
 
         # Постобработка GFPGAN — не должна ронять всю задачу, если вдруг
         # упадёт по какой-то причине: в этом случае просто отдаём видео
