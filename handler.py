@@ -13,30 +13,24 @@ import yaml
 # здесь просто нет глобальной загрузки на этапе импорта — уже "лениво"
 # по устройству самого MuseTalk CLI.
 
+# Ошибка "MuseTalk не создал видео" (exit code 0, файла нет) — это
+# исчерпывающе диагностированный off-by-N баг в сопоставлении
+# кадр видео -> индекс аудио-признака у последних кадров ролика (см.
+# историю чата). Подрезка фиксированного числа кадров ЧАСТИЧНО решает
+# проблему, но не полностью — судя по наблюдениям, массив признаков
+# сам пересчитывается от длины уже обрезанного видео, так что нужный
+# запас "плавает" в зависимости от исходной длительности/fps и заранее
+# точно не вычисляется без доступа к внутренностям этой сборки
+# MuseTalk. Поэтому вместо одной статичной подрезки — несколько попыток
+# со всё большей подрезкой, если конкретно эта ошибка повторяется.
+TRIM_ATTEMPTS_FRAMES = [8, 20, 40, 70]
 
-def trim_trailing_video_frames(video_path, work_dir, frames_to_drop=8):
-    """Настоящая причина 'MuseTalk не создал видео' (найдена сравнением
-    нескольких реальных сбоев): длина массива аудио-признаков внутри
-    MuseTalk (whisper_feature) зависит от ДЛИНЫ ВИДЕО, а не от длины
-    переданного аудио — во всех зафиксированных случаях наблюдаемая
-    длина этого массива точно совпадала с формулой
-    (длительность_видео_сек × 50 + 8), независимо от того, насколько
-    длиннее мы делали аудио-дорожку (см. историю чата — три попытки
-    удлинить аудио не дали никакого эффекта на размер этого массива).
 
-    При этом для последних кадров видео требуемый индекс аудио-признака
-    стабильно выходит за конец этого массива РОВНО на 2 позиции — это
-    похоже на встроенный off-by-two в собственной логике сопоставления
-    кадр→аудио-признак этой сборки MuseTalk у самой границы клипа, а
-    не проблема длины аудио. "Нестабильность" бага объясняется тем, что
-    для одних сочетаний длительности/fps округление не доходит до
-    переполнения, для других — доходит.
-
-    Решение: отрезаем несколько последних кадров ВИДЕО (доли секунды,
-    незаметно) перед запуском MuseTalk — это гарантированно уводит
-    последний обрабатываемый кадр от границы массива. frames_to_drop=8
-    — с большим запасом относительно расчётного минимума (~3 кадра для
-    типичных 59-60 fps)."""
+def probe_video_frames_and_fps(video_path):
+    """Возвращает (nb_frames, fps), посчитанные из РЕАЛЬНОГО числа
+    декодированных кадров — то же самое, что видит MuseTalk при
+    покадровом чтении файла (метаданным контейнера доверять нельзя,
+    см. историю чата)."""
     probe = subprocess.run(
         [
             "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
@@ -52,39 +46,44 @@ def trim_trailing_video_frames(video_path, work_dir, frames_to_drop=8):
             key, _, value = line.partition("=")
             values[key.strip()] = value.strip()
 
-    try:
-        nb_frames = int(values["nb_read_frames"])
-        num, den = values["avg_frame_rate"].split("/")
-        fps = float(num) / float(den)
-    except (KeyError, ValueError, ZeroDivisionError):
-        # Не смогли посчитать кадры — не блокируем генерацию из-за
-        # диагностики, просто пропускаем подрезку. В худшем случае
-        # исходный баг проявится снова и будет видно по логам.
-        print(f"trim_trailing_video_frames: не удалось разобрать вывод ffprobe: {values}, пропускаю подрезку")
-        return video_path
+    nb_frames = int(values["nb_read_frames"])
+    num, den = values["avg_frame_rate"].split("/")
+    fps = float(num) / float(den)
+    return nb_frames, fps
+
+
+def trim_trailing_video_frames(original_video_path, work_dir, frames_to_drop):
+    """Отрезает frames_to_drop последних кадров исходного видео (доли
+    секунды при typичных fps). Всегда работает от original_video_path,
+    а не от уже обрезанной версии — чтобы повторные попытки не
+    накапливали подрезку сверх задуманной."""
+    nb_frames, fps = probe_video_frames_and_fps(original_video_path)
 
     if nb_frames <= frames_to_drop:
-        return video_path
+        return original_video_path
 
     keep_frames = nb_frames - frames_to_drop
     trimmed_duration = keep_frames / fps
-    trimmed_path = os.path.join(work_dir, "source_video_for_musetalk.mp4")
-    try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", video_path,
-                "-t", f"{trimmed_duration:.4f}",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                "-an",
-                trimmed_path,
-            ],
-            capture_output=True, text=True, check=True
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"trim_trailing_video_frames: ffmpeg не смог подрезать видео, использую исходное: {e.stderr[-1000:]}")
-        return video_path
-
+    trimmed_path = os.path.join(work_dir, f"source_video_trim{frames_to_drop}.mp4")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", original_video_path,
+            "-t", f"{trimmed_duration:.4f}",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-an",
+            trimmed_path,
+        ],
+        capture_output=True, text=True, check=True
+    )
     return trimmed_path
+
+
+def is_no_output_video_error(exc):
+    """True, если исключение — тот самый диагностированный сбой
+    (exit code 0, но mp4 не создан), а не что-то другое (например,
+    реальный краш MuseTalk по другой причине). Только в этом случае
+    имеет смысл повторять попытку с большей подрезкой видео."""
+    return isinstance(exc, RuntimeError) and str(exc).startswith("MuseTalk не создал видео")
 
 
 def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
@@ -131,14 +130,31 @@ def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
             if f.endswith(".mp4"):
                 return os.path.join(root, f)
 
-    # "Тихий" сбой: код завершения 0, но выходного файла нет. Оставлено
-    # на случай, если trim_trailing_video_frames не покрыла все причины —
-    # stdout/stderr дадут диагностику для следующего разбора.
     raise RuntimeError(
         "MuseTalk не создал видео.\n"
         f"--- stdout (конец) ---\n{proc.stdout[-2000:]}\n"
         f"--- stderr (конец) ---\n{proc.stderr[-2000:]}"
     )
+
+
+def run_musetalk_with_retries(original_video_path, audio_path, work_dir):
+    """Обёртка над run_musetalk_inference с автоматическими повторами
+    при увеличивающейся подрезке хвоста видео — см. комментарий у
+    TRIM_ATTEMPTS_FRAMES выше про причину, почему одна фиксированная
+    подрезка не гарантирует успех для любого видео."""
+    last_exc = None
+    for attempt_index, frames_to_drop in enumerate(TRIM_ATTEMPTS_FRAMES, start=1):
+        result_dir = os.path.join(work_dir, f"results_attempt{attempt_index}")
+        video_path = trim_trailing_video_frames(original_video_path, work_dir, frames_to_drop)
+        try:
+            return run_musetalk_inference(video_path, audio_path, work_dir, result_dir)
+        except Exception as e:
+            last_exc = e
+            if not is_no_output_video_error(e):
+                raise
+            print(f"Попытка {attempt_index} (подрезка {frames_to_drop} кадров) не удалась: {e}. Пробую следующую.")
+
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -258,10 +274,7 @@ def handler(event):
         with open(audio_path, "wb") as f:
             f.write(base64.b64decode(input_data["audio_base64"]))
 
-        video_path = trim_trailing_video_frames(video_path, work_dir)
-
-        result_dir = f"{work_dir}/results"
-        output_video_path = run_musetalk_inference(video_path, audio_path, work_dir, result_dir)
+        output_video_path = run_musetalk_with_retries(video_path, audio_path, work_dir)
 
         # Постобработка GFPGAN — не должна ронять всю задачу, если вдруг
         # упадёт по какой-то причине: в этом случае просто отдаём видео
