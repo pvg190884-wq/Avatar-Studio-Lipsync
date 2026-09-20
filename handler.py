@@ -35,31 +35,44 @@ def get_video_frame_duration_seconds(video_path):
     MuseTalk при покадровом чтении файла. Метаданные длительности
     контейнера (format=duration) у некоторых mp4 (особенно с телефона
     или веб-камеры) оказались занижены относительно реального числа
-    кадров на десятые доли секунды — именно из-за этого предыдущая
-    версия фикса (запас в 1с, посчитанный от format=duration) почти
+    кадров на десятые доли секунды — именно из-за этого более ранняя
+    версия фикса (запас, посчитанный от format=duration) почти
     полностью съедалась этой погрешностью измерения и не оставляла
     MuseTalk реального запаса (см. диагностику в чате: расхождение
-    ~0.84с на реальном видео пользователя)."""
+    ~0.84с на реальном видео пользователя).
+
+    ВАЖНО: парсим вывод по имени поля (key=value), а не по позиции
+    строки — более ранняя версия жёстко ожидала nb_read_frames первой
+    строкой, а avg_frame_rate второй, но реальный порядок вывода
+    ffprobe оказался обратным, из-за чего парсинг падал с
+    'invalid literal for int()' на числах вида '60/1'."""
     result = subprocess.run(
         [
             "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
             "-show_entries", "stream=nb_read_frames,avg_frame_rate",
-            "-of", "default=noprint_wrappers=1:nokey=1",
+            "-of", "default=noprint_wrappers=1",
             video_path,
         ],
         capture_output=True, text=True
     )
-    lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
-    if len(lines) < 2:
-        raise RuntimeError(f"Не удалось посчитать кадры видео через ffprobe: {result.stderr}")
 
-    nb_frames_str, frame_rate_str = lines[0], lines[1]
+    values = {}
+    for line in result.stdout.strip().splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip()
+
+    nb_frames_str = values.get("nb_read_frames")
+    frame_rate_str = values.get("avg_frame_rate")
+    if not nb_frames_str or not frame_rate_str:
+        raise RuntimeError(f"Не удалось разобрать вывод ffprobe: {result.stdout!r} / stderr: {result.stderr}")
+
     try:
         nb_frames = int(nb_frames_str)
         num, den = frame_rate_str.split("/")
         fps = float(num) / float(den)
     except (ValueError, ZeroDivisionError):
-        raise RuntimeError(f"Не удалось разобрать вывод ffprobe: {lines}")
+        raise RuntimeError(f"Не удалось разобрать числа из вывода ffprobe: {values}")
 
     return nb_frames / fps
 
@@ -74,10 +87,9 @@ def pad_audio_to_video_length(audio_path, video_path, work_dir, margin_seconds=2
 
     Длительность видео считается через get_video_frame_duration_seconds
     (по реальному числу кадров), а не через метаданные контейнера —
-    на них нельзя полагаться (см. её docstring). Запас увеличен до
-    2.5с — с большим избытком относительно наблюдавшихся расхождений
-    (~0.84с погрешности измерения + ~0.2с самого требуемого MuseTalk
-    контекста).
+    на них нельзя полагаться (см. её docstring). Запас — 2.5с, с
+    избытком относительно наблюдавшихся расхождений (~0.84с погрешности
+    измерения + ~0.2с самого требуемого MuseTalk контекста).
 
     Решение: дополняем аудио-дорожку тишиной в конце. Финальное видео
     при этом НЕ укорачивается: длительность результата определяется
