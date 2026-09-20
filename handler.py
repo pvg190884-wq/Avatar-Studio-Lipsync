@@ -14,39 +14,30 @@ import yaml
 # по устройству самого MuseTalk CLI.
 
 
-def get_media_duration_seconds(path):
-    """Читает длительность файла через метаданные контейнера (ffprobe
-    format=duration). Годится для аудио (WAV с простым заголовком), но
-    НЕ для видео — см. get_video_frame_duration_seconds ниже."""
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", path],
-        capture_output=True, text=True
-    )
-    try:
-        return float(result.stdout.strip())
-    except ValueError:
-        raise RuntimeError(f"Не удалось определить длительность файла {path}: {result.stderr}")
+def trim_trailing_video_frames(video_path, work_dir, frames_to_drop=8):
+    """Настоящая причина 'MuseTalk не создал видео' (найдена сравнением
+    нескольких реальных сбоев): длина массива аудио-признаков внутри
+    MuseTalk (whisper_feature) зависит от ДЛИНЫ ВИДЕО, а не от длины
+    переданного аудио — во всех зафиксированных случаях наблюдаемая
+    длина этого массива точно совпадала с формулой
+    (длительность_видео_сек × 50 + 8), независимо от того, насколько
+    длиннее мы делали аудио-дорожку (см. историю чата — три попытки
+    удлинить аудио не дали никакого эффекта на размер этого массива).
 
+    При этом для последних кадров видео требуемый индекс аудио-признака
+    стабильно выходит за конец этого массива РОВНО на 2 позиции — это
+    похоже на встроенный off-by-two в собственной логике сопоставления
+    кадр→аудио-признак этой сборки MuseTalk у самой границы клипа, а
+    не проблема длины аудио. "Нестабильность" бага объясняется тем, что
+    для одних сочетаний длительности/fps округление не доходит до
+    переполнения, для других — доходит.
 
-def get_video_frame_duration_seconds(video_path):
-    """Возвращает длительность видео, посчитанную из РЕАЛЬНОГО числа
-    декодированных кадров и частоты кадров — то же самое, что видит
-    MuseTalk при покадровом чтении файла. Метаданные длительности
-    контейнера (format=duration) у некоторых mp4 (особенно с телефона
-    или веб-камеры) оказались занижены относительно реального числа
-    кадров на десятые доли секунды — именно из-за этого более ранняя
-    версия фикса (запас, посчитанный от format=duration) почти
-    полностью съедалась этой погрешностью измерения и не оставляла
-    MuseTalk реального запаса (см. диагностику в чате: расхождение
-    ~0.84с на реальном видео пользователя).
-
-    ВАЖНО: парсим вывод по имени поля (key=value), а не по позиции
-    строки — более ранняя версия жёстко ожидала nb_read_frames первой
-    строкой, а avg_frame_rate второй, но реальный порядок вывода
-    ffprobe оказался обратным, из-за чего парсинг падал с
-    'invalid literal for int()' на числах вида '60/1'."""
-    result = subprocess.run(
+    Решение: отрезаем несколько последних кадров ВИДЕО (доли секунды,
+    незаметно) перед запуском MuseTalk — это гарантированно уводит
+    последний обрабатываемый кадр от границы массива. frames_to_drop=8
+    — с большим запасом относительно расчётного минимума (~3 кадра для
+    типичных 59-60 fps)."""
+    probe = subprocess.run(
         [
             "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
             "-show_entries", "stream=nb_read_frames,avg_frame_rate",
@@ -55,68 +46,45 @@ def get_video_frame_duration_seconds(video_path):
         ],
         capture_output=True, text=True
     )
-
     values = {}
-    for line in result.stdout.strip().splitlines():
+    for line in probe.stdout.strip().splitlines():
         if "=" in line:
             key, _, value = line.partition("=")
             values[key.strip()] = value.strip()
 
-    nb_frames_str = values.get("nb_read_frames")
-    frame_rate_str = values.get("avg_frame_rate")
-    if not nb_frames_str or not frame_rate_str:
-        raise RuntimeError(f"Не удалось разобрать вывод ffprobe: {result.stdout!r} / stderr: {result.stderr}")
-
     try:
-        nb_frames = int(nb_frames_str)
-        num, den = frame_rate_str.split("/")
+        nb_frames = int(values["nb_read_frames"])
+        num, den = values["avg_frame_rate"].split("/")
         fps = float(num) / float(den)
-    except (ValueError, ZeroDivisionError):
-        raise RuntimeError(f"Не удалось разобрать числа из вывода ffprobe: {values}")
+    except (KeyError, ValueError, ZeroDivisionError):
+        # Не смогли посчитать кадры — не блокируем генерацию из-за
+        # диагностики, просто пропускаем подрезку. В худшем случае
+        # исходный баг проявится снова и будет видно по логам.
+        print(f"trim_trailing_video_frames: не удалось разобрать вывод ffprobe: {values}, пропускаю подрезку")
+        return video_path
 
-    return nb_frames / fps
+    if nb_frames <= frames_to_drop:
+        return video_path
 
-
-def pad_audio_to_video_length(audio_path, video_path, work_dir, margin_seconds=2.5):
-    """Причина 'MuseTalk не создал видео' (найдено по логам stdout):
-    внутри MuseTalk каждому кадру видео сопоставляется окно
-    whisper-аудио-признаков с отступом вперёд для временного контекста.
-    У последних кадров видео это окно выходит за пределы массива
-    признаков, если у аудио нет достаточного запаса длительности сверх
-    длительности видео.
-
-    Длительность видео считается через get_video_frame_duration_seconds
-    (по реальному числу кадров), а не через метаданные контейнера —
-    на них нельзя полагаться (см. её docstring). Запас — 2.5с, с
-    избытком относительно наблюдавшихся расхождений (~0.84с погрешности
-    измерения + ~0.2с самого требуемого MuseTalk контекста).
-
-    Решение: дополняем аудио-дорожку тишиной в конце. Финальное видео
-    при этом НЕ укорачивается: длительность результата определяется
-    видео, а лишняя тишина в конце аудио отбрасывается собственной
-    логикой сборки MuseTalk."""
-    video_duration = get_video_frame_duration_seconds(video_path)
-    audio_duration = get_media_duration_seconds(audio_path)
-    target_duration = video_duration + margin_seconds
-
-    if audio_duration >= target_duration:
-        return audio_path
-
-    padded_path = os.path.join(work_dir, "driven_audio_padded.wav")
+    keep_frames = nb_frames - frames_to_drop
+    trimmed_duration = keep_frames / fps
+    trimmed_path = os.path.join(work_dir, "source_video_for_musetalk.mp4")
     try:
         subprocess.run(
             [
-                "ffmpeg", "-y", "-i", audio_path,
-                "-af", "apad",
-                "-t", f"{target_duration:.3f}",
-                padded_path,
+                "ffmpeg", "-y", "-i", video_path,
+                "-t", f"{trimmed_duration:.4f}",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-an",
+                trimmed_path,
             ],
             capture_output=True, text=True, check=True
         )
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Не удалось дополнить аудио тишиной: {e.stderr[-1500:]}")
+        print(f"trim_trailing_video_frames: ffmpeg не смог подрезать видео, использую исходное: {e.stderr[-1000:]}")
+        return video_path
 
-    return padded_path
+    return trimmed_path
 
 
 def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
@@ -164,7 +132,7 @@ def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
                 return os.path.join(root, f)
 
     # "Тихий" сбой: код завершения 0, но выходного файла нет. Оставлено
-    # на случай, если pad_audio_to_video_length не покрыла все причины —
+    # на случай, если trim_trailing_video_frames не покрыла все причины —
     # stdout/stderr дадут диагностику для следующего разбора.
     raise RuntimeError(
         "MuseTalk не создал видео.\n"
@@ -290,7 +258,7 @@ def handler(event):
         with open(audio_path, "wb") as f:
             f.write(base64.b64decode(input_data["audio_base64"]))
 
-        audio_path = pad_audio_to_video_length(audio_path, video_path, work_dir)
+        video_path = trim_trailing_video_frames(video_path, work_dir)
 
         result_dir = f"{work_dir}/results"
         output_video_path = run_musetalk_inference(video_path, audio_path, work_dir, result_dir)
