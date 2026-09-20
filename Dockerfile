@@ -9,6 +9,12 @@ RUN apt-get update && apt-get install -y ffmpeg git libgl1 libglib2.0-0 curl && 
 RUN git clone https://github.com/TMElyralab/MuseTalk.git
 WORKDIR /app/MuseTalk
 
+# Патч известного edge-case в аудио-обработке апстрим MuseTalk (наш
+# главный воспроизводимый баг "MuseTalk не создал видео") — подробный
+# разбор причины и сам фикс см. в patch_musetalk_audio.py.
+COPY patch_musetalk_audio.py /tmp/patch_musetalk_audio.py
+RUN python3 /tmp/patch_musetalk_audio.py
+
 # Зависимости MuseTalk. requirements.txt в самом репозитории обычно
 # покрывает основное, но mmcv/mmpose/mmdet ставятся отдельно через
 # openmim, т.к. требуют точного соответствия версии torch/CUDA.
