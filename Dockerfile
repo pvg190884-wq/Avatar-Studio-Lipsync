@@ -15,6 +15,9 @@ WORKDIR /app/MuseTalk
 COPY patch_musetalk_audio.py /tmp/patch_musetalk_audio.py
 RUN python3 /tmp/patch_musetalk_audio.py
 
+COPY patch_musetalk_bbox.py /tmp/patch_musetalk_bbox.py
+RUN python3 /tmp/patch_musetalk_bbox.py
+
 # Зависимости MuseTalk. requirements.txt в самом репозитории обычно
 # покрывает основное, но mmcv/mmpose/mmdet ставятся отдельно через
 # openmim, т.к. требуют точного соответствия версии torch/CUDA.
