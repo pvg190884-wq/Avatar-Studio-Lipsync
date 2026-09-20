@@ -13,6 +13,61 @@ import yaml
 # здесь просто нет глобальной загрузки на этапе импорта — уже "лениво"
 # по устройству самого MuseTalk CLI.
 
+# MuseTalk обрабатывает КАЖДЫЙ кадр видео отдельно на всех тяжёлых
+# этапах (детекция лица/landmarks, сама генерация, затем GFPGAN
+# покадрово) — поэтому итоговое время генерации почти линейно зависит
+# от числа кадров. Видео с телефона часто снимается на 50-60 fps, хотя
+# для говорящей головы этого совершенно не нужно: 25 fps — стандарт
+# для такого контента, разница в плавности речи не заметна на глаз, а
+# кадров становится более чем вдвое меньше, что почти вдвое ускоряет
+# все последующие этапы (см. диагностику в чате: 8-секундный ролик на
+# 60 fps занял 16 минут, из них большая часть — покадровая обработка).
+TARGET_FPS = 25
+
+
+def normalize_video_fps(input_path, work_dir, target_fps=TARGET_FPS):
+    """Переприводит видео к target_fps, если исходный fps выше. Не
+    трогает видео, которое уже на target_fps или ниже — не имеет смысла
+    искусственно повышать частоту кадров, только количество работы для
+    модели, никакого выигрыша в качестве. Звук не трогается вообще (-an
+    убирает исходную аудиодорожку из этого промежуточного файла — она
+    всё равно не используется MuseTalk напрямую как input audio, драйвер
+    аудио передаётся отдельным файлом audio_path)."""
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=r_frame_rate", "-of",
+         "default=noprint_wrappers=1:nokey=1", input_path],
+        capture_output=True, text=True
+    )
+    try:
+        num, den = probe.stdout.strip().split("/")
+        source_fps = float(num) / float(den)
+    except (ValueError, ZeroDivisionError):
+        print(f"normalize_video_fps: не удалось определить исходный fps ({probe.stdout!r}), пропускаю нормализацию")
+        return input_path
+
+    if source_fps <= target_fps + 0.1:
+        return input_path
+
+    normalized_path = os.path.join(work_dir, "source_video_fps.mp4")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", input_path,
+                "-r", str(target_fps),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-an",
+                normalized_path,
+            ],
+            capture_output=True, text=True, check=True
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"normalize_video_fps: ffmpeg не смог понизить fps, использую исходное видео: {e.stderr[-1000:]}")
+        return input_path
+
+    print(f"normalize_video_fps: {source_fps:.1f} -> {target_fps} fps")
+    return normalized_path
+
 
 def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
     """Запускает inference MuseTalk через его CLI-скрипт.
@@ -20,15 +75,7 @@ def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
     --video_path/--audio_path — вместо этого он принимает YAML-файл
     через --inference_config, где перечисляются задачи (video_path +
     audio_path на каждую). Формируем такой конфиг на лету под один
-    запрос.
-
-    Ранее здесь были обходные пути для бага "MuseTalk не создал видео"
-    (подрезка видео, паддинг аудио, повторные попытки) — все они лечили
-    симптом, а не причину. Настоящая причина — off-by-N edge-case
-    внутри самой библиотеки MuseTalk (musetalk/utils/audio_processor.py),
-    из-за которого процесс завершался с кодом 0 без записи файла (exit()
-    без аргументов = sys.exit(None)). Пофикшено патчем исходника прямо
-    в Docker-образе — см. patch_musetalk_audio.py и Dockerfile."""
+    запрос."""
     os.makedirs(result_dir, exist_ok=True)
 
     inference_config = {
@@ -66,9 +113,6 @@ def run_musetalk_inference(video_path, audio_path, work_dir, result_dir):
             if f.endswith(".mp4"):
                 return os.path.join(root, f)
 
-    # Если эта ветка всё же сработает после патча — значит, патч не
-    # покрыл какой-то другой сценарий, и stdout/stderr дадут диагностику
-    # для следующего разбора.
     raise RuntimeError(
         "MuseTalk не создал видео.\n"
         f"--- stdout (конец) ---\n{proc.stdout[-2000:]}\n"
@@ -192,6 +236,8 @@ def handler(event):
         audio_path = f"{work_dir}/driven_audio.wav"
         with open(audio_path, "wb") as f:
             f.write(base64.b64decode(input_data["audio_base64"]))
+
+        video_path = normalize_video_fps(video_path, work_dir)
 
         result_dir = f"{work_dir}/results"
         output_video_path = run_musetalk_inference(video_path, audio_path, work_dir, result_dir)
