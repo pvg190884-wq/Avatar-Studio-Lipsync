@@ -15,7 +15,9 @@ import yaml
 
 
 def get_media_duration_seconds(path):
-    """Читает длительность файла через ffprobe (в секундах, float)."""
+    """Читает длительность файла через метаданные контейнера (ffprobe
+    format=duration). Годится для аудио (WAV с простым заголовком), но
+    НЕ для видео — см. get_video_frame_duration_seconds ниже."""
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", path],
@@ -27,26 +29,61 @@ def get_media_duration_seconds(path):
         raise RuntimeError(f"Не удалось определить длительность файла {path}: {result.stderr}")
 
 
-def pad_audio_to_video_length(audio_path, video_path, work_dir, margin_seconds=1.0):
-    """Настоящая причина 'MuseTalk не создал видео' (найдено по логам
-    stdout, см. историю чата): внутри MuseTalk каждому кадру видео
-    сопоставляется окно whisper-аудио-признаков с отступом вперёд для
-    временного контекста. У последних кадров видео это окно выходит за
-    пределы массива признаков, даже когда видео УЖЕ короче аудио —
-    во всех трёх зафиксированных случаях выход был ровно на 2 индекса,
-    независимо от того, обрезано видео или нет. То есть дело не в том,
-    что видео длиннее аудио, а в том, что аудио не имеет запаса для
-    заглядывания вперёд у самых последних кадров.
+def get_video_frame_duration_seconds(video_path):
+    """Возвращает длительность видео, посчитанную из РЕАЛЬНОГО числа
+    декодированных кадров и частоты кадров — то же самое, что видит
+    MuseTalk при покадровом чтении файла. Метаданные длительности
+    контейнера (format=duration) у некоторых mp4 (особенно с телефона
+    или веб-камеры) оказались занижены относительно реального числа
+    кадров на десятые доли секунды — именно из-за этого предыдущая
+    версия фикса (запас в 1с, посчитанный от format=duration) почти
+    полностью съедалась этой погрешностью измерения и не оставляла
+    MuseTalk реального запаса (см. диагностику в чате: расхождение
+    ~0.84с на реальном видео пользователя)."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+            "-show_entries", "stream=nb_read_frames,avg_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            video_path,
+        ],
+        capture_output=True, text=True
+    )
+    lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+    if len(lines) < 2:
+        raise RuntimeError(f"Не удалось посчитать кадры видео через ffprobe: {result.stderr}")
 
-    Решение: дополняем аудио-дорожку тишиной в конце так, чтобы её
-    длительность гарантированно превышала длительность видео на
-    margin_seconds (с большим запасом относительно фактически
-    нужных ~0.2 сек) — этого достаточно для окна контекста при любых
-    кадрах видео. Финальное видео при этом НЕ укорачивается и не
-    обрезается: длительность результата определяется видео, а лишняя
-    тишина в конце аудио отбрасывается собственной логикой сборки
-    MuseTalk."""
-    video_duration = get_media_duration_seconds(video_path)
+    nb_frames_str, frame_rate_str = lines[0], lines[1]
+    try:
+        nb_frames = int(nb_frames_str)
+        num, den = frame_rate_str.split("/")
+        fps = float(num) / float(den)
+    except (ValueError, ZeroDivisionError):
+        raise RuntimeError(f"Не удалось разобрать вывод ffprobe: {lines}")
+
+    return nb_frames / fps
+
+
+def pad_audio_to_video_length(audio_path, video_path, work_dir, margin_seconds=2.5):
+    """Причина 'MuseTalk не создал видео' (найдено по логам stdout):
+    внутри MuseTalk каждому кадру видео сопоставляется окно
+    whisper-аудио-признаков с отступом вперёд для временного контекста.
+    У последних кадров видео это окно выходит за пределы массива
+    признаков, если у аудио нет достаточного запаса длительности сверх
+    длительности видео.
+
+    Длительность видео считается через get_video_frame_duration_seconds
+    (по реальному числу кадров), а не через метаданные контейнера —
+    на них нельзя полагаться (см. её docstring). Запас увеличен до
+    2.5с — с большим избытком относительно наблюдавшихся расхождений
+    (~0.84с погрешности измерения + ~0.2с самого требуемого MuseTalk
+    контекста).
+
+    Решение: дополняем аудио-дорожку тишиной в конце. Финальное видео
+    при этом НЕ укорачивается: длительность результата определяется
+    видео, а лишняя тишина в конце аудио отбрасывается собственной
+    логикой сборки MuseTalk."""
+    video_duration = get_video_frame_duration_seconds(video_path)
     audio_duration = get_media_duration_seconds(audio_path)
     target_duration = video_duration + margin_seconds
 
